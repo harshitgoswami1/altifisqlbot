@@ -4,6 +4,7 @@ import json
 from fastapi.testclient import TestClient
 
 from main import ChatService, Settings, create_app, encode_sse, stream_chat
+from prompts import SYSTEM_PROMPT
 
 
 class FakeService:
@@ -39,6 +40,15 @@ def parse_sse(body):
         assert lines[1].startswith("data: ")
         parsed.append((lines[0][7:], json.loads(lines[1][6:])))
     return parsed
+
+
+def test_system_prompt_renders_table_and_columns():
+    rendered = SYSTEM_PROMPT.format(
+        table_name="scraped_bonds",
+        columns="- isin (text)",
+    )
+    assert "PostgreSQL table scraped_bonds" in rendered
+    assert "- isin (text)" in rendered
 
 
 def test_request_validation():
