@@ -1,0 +1,8 @@
+langchain
+langchain_community
+langchain-ollama
+python-dotenv
+langchain-google-genai
+ipykernel
+uvicorn
+fastapi
