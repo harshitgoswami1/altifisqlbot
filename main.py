@@ -186,6 +186,7 @@ def make_query_tool(settings: Settings):
 
         Use this tool to answer questions about records in the database.
         Only query the configured table and its columns. Do not modify data.
+        Can call it multiple times for multi-step questions.
         """
 
         sql = sql.strip().rstrip(";")
