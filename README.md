@@ -1,8 +1,10 @@
 # SQL agent backend
 
-FastAPI wrapper for the PostgreSQL + Ollama agent in `notebooks/brute.ipynb`.
-It exposes the frontend contract at `POST /v1/chat/stream` and streams JSON SSE
-events (`citations`, `token`, then `done`; or `error` after streaming begins).
+FastAPI backend for the PostgreSQL + Ollama agent. Its conversation flow follows
+`notebooks/chatbotbasic.ipynb`: a LangGraph chatbot node calls the model, a tool
+node runs database queries, and a checkpointer retains messages by conversation ID.
+`POST /v1/chat/stream` streams JSON SSE events (`conversation`, `citations`,
+`token`, then `done`; or `error` after streaming begins).
 
 ## Local startup
 
@@ -50,6 +52,19 @@ curl -N http://127.0.0.1:8000/v1/chat/stream \
   --data '{"question":"What is a fixed deposit?"}'
 ```
 
+The first SSE event contains a generated `conversation_id`. Send that UUID with
+each follow-up to keep the same chat history:
+
+```sh
+curl -N http://127.0.0.1:8000/v1/chat/stream \
+  -H 'Content-Type: application/json' \
+  --data '{"question":"What about its yield?","conversation_id":"<UUID from first event>"}'
+```
+
+Omit `conversation_id` to start a new chat. History is kept in process memory,
+as in the notebook, so it is lost on restart and is not shared across workers.
+Run a single worker for conversation continuity.
+
 Cancel the request with Ctrl-C. The server detects the disconnect and closes the
 upstream agent stream.
 
@@ -81,8 +96,8 @@ for production.
 
 ## Scope assumptions
 
-This preserves the notebook's single-question, stateless behavior and its
-`scraped_bonds` table. It does not add authentication, accounts, conversation
-history, persistence, uploads, or WebSockets. Add those only after defining their
-authorization, retention, and API requirements; none are needed by the current
-frontend contract.
+This retains the `scraped_bonds` table and read-only query tool. It does not add
+authentication, accounts, durable history, uploads, or WebSockets. The
+`conversation_id` is a routing key, not an authorization mechanism; clients that
+share an ID share its history. Add authentication and a persistent checkpointer
+before serving independent users or scaling to multiple workers.

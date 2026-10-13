@@ -7,7 +7,7 @@ import uuid
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, AsyncIterator
+from typing import Annotated, Any, AsyncIterator, TypedDict
 from urllib.parse import parse_qs, urlparse
 
 import psycopg
@@ -15,9 +15,13 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from langchain.agents import create_agent
+from langchain_core.messages import SystemMessage
 from langchain.tools import tool
 from langchain_ollama import ChatOllama
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.graph import END, START, StateGraph
+from langgraph.graph.message import add_messages
+from langgraph.prebuilt import ToolNode, tools_condition
 from psycopg.rows import dict_row
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -96,11 +100,16 @@ class ChatRequest(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
 
     question: str = Field(min_length=1, max_length=4_000)
+    conversation_id: uuid.UUID | None = None
+
+
+class ChatState(TypedDict):
+    messages: Annotated[list, add_messages]
 
 
 class ChatService:
-    def __init__(self, agent: Any):
-        self.agent = agent
+    def __init__(self, graph: Any):
+        self.graph = graph
 
     @classmethod
     def build(cls, settings: Settings) -> "ChatService":
@@ -109,21 +118,33 @@ class ChatService:
         columns_for_prompt = "\n".join(
             f"- {column['column_name']} ({column['data_type']})" for column in schema
         )
-        model = ChatOllama(model=settings.model, base_url=settings.ollama_base_url)
-        agent = create_agent(
-            model=model,
-            tools=[query_database],
-            system_prompt=SYSTEM_PROMPT.format(
-                table_name=TABLE_NAME,
-                columns=columns_for_prompt,
-            ),
+        model = ChatOllama(
+            model=settings.model, base_url=settings.ollama_base_url
+        ).bind_tools([query_database])
+        system_message = SystemMessage(
+            content=SYSTEM_PROMPT.format(
+                table_name=TABLE_NAME, columns=columns_for_prompt
+            )
         )
-        return cls(agent)
 
-    async def stream(self, question: str) -> AsyncIterator[tuple[str, Any]]:
+        async def chatbot(state: ChatState) -> dict[str, list]:
+            response = await model.ainvoke([system_message, *state["messages"]])
+            return {"messages": [response]}
+
+        builder = StateGraph(ChatState)
+        builder.add_node("chatbot", chatbot)
+        builder.add_node("tools", ToolNode([query_database]))
+        builder.add_edge(START, "chatbot")
+        builder.add_conditional_edges("chatbot", tools_condition, {"tools": "tools", END: END})
+        builder.add_edge("tools", "chatbot")
+        return cls(builder.compile(checkpointer=MemorySaver()))
+
+    async def stream(self, question: str, conversation_id: str) -> AsyncIterator[tuple[str, Any]]:
         seen_urls: set[str] = set()
-        async for event in self.agent.astream_events(
-            {"messages": [{"role": "user", "content": question}]}, version="v2"
+        async for event in self.graph.astream_events(
+            {"messages": [{"role": "user", "content": question}]},
+            config={"configurable": {"thread_id": conversation_id}},
+            version="v2",
         ):
             if event["event"] == "on_tool_end" and event.get("name") == "query_database":
                 output = event.get("data", {}).get("output", "")
@@ -231,14 +252,18 @@ async def stream_chat(
     request: Request,
     service: Any,
     question: str,
+    conversation_id: str,
     timeout_seconds: float,
     request_id: str,
 ) -> AsyncIterator[bytes]:
-    iterator = service.stream(question).__aiter__()
+    iterator = service.stream(question, conversation_id).__aiter__()
     disconnect_task = asyncio.create_task(wait_for_disconnect(request))
     next_task: asyncio.Task | None = None
     log_event(logging.INFO, "chat_started", request_id=request_id)
     try:
+        if await request.is_disconnected():
+            return
+        yield encode_sse("conversation", {"conversation_id": conversation_id})
         async with asyncio.timeout(timeout_seconds):
             while True:
                 next_task = asyncio.create_task(anext(iterator))
@@ -354,8 +379,11 @@ def create_app(
         active_settings = getattr(request.app.state, "settings", settings)
         timeout = active_settings.chat_timeout_seconds if active_settings else 120.0
         request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+        conversation_id = str(payload.conversation_id or uuid.uuid4())
         return StreamingResponse(
-            stream_chat(request, chat_service, payload.question, timeout, request_id),
+            stream_chat(
+                request, chat_service, payload.question, conversation_id, timeout, request_id
+            ),
             headers={
                 "Content-Type": "text/event-stream",
                 "Cache-Control": "no-cache, no-transform",
